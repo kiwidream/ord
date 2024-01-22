@@ -314,10 +314,10 @@ impl TransactionBuilder {
         self.outputs.last_mut().unwrap().1 += value;
 
         if benefit > deficit {
-          tprintln!("added {value} sat input to cover {deficit} sat deficit");
+          println!("added {value} sat input to cover {deficit} sat deficit");
           deficit = Amount::ZERO;
         } else {
-          tprintln!("added {value} sat input to reduce {deficit} sat deficit by {benefit} sat");
+          println!("added {value} sat input to reduce {deficit} sat deficit by {benefit} sat");
           deficit -= benefit;
         }
       }

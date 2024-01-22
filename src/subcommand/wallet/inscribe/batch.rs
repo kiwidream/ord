@@ -246,27 +246,19 @@ impl Batch {
       ),
     }
 
+    let cardinal_satpoint = Self::find_cardinal_utxo(
+      &Amount::from_sat(0),
+      None,
+      &utxos,
+      wallet_inscriptions.clone(),
+      locked_utxos.clone(),
+      runic_utxos.clone()
+    );
+
     let commit_satpoint = if let Some(commit_satpoint) = self.commit_satpoint {
       commit_satpoint
     } else {
-      let inscribed_utxos = wallet_inscriptions
-        .keys()
-        .map(|satpoint| satpoint.outpoint)
-        .collect::<BTreeSet<OutPoint>>();
-
-      utxos
-        .iter()
-        .find(|(outpoint, amount)| {
-          amount.to_sat() > 0
-            && !inscribed_utxos.contains(outpoint)
-            && !locked_utxos.contains(outpoint)
-            && !runic_utxos.contains(outpoint)
-        })
-        .map(|(outpoint, _amount)| SatPoint {
-          outpoint: *outpoint,
-          offset: 0,
-        })
-        .ok_or_else(|| anyhow!("wallet contains no cardinal utxos"))?
+      cardinal_satpoint
     };
 
     let mut reinscription = false;
@@ -362,7 +354,7 @@ impl Batch {
     } else {
       reveal_inputs = Vec::new();
 
-      for (pos, &satpoint) in self.reveal_satpoints.iter().rev().enumerate() {
+      for (pos, &satpoint) in self.reveal_satpoints.iter().enumerate() {
         if let Ok(tx_out) = index.get_tx_out(satpoint) {
           reveal_tx_outs.push(tx_out.clone());
           reveal_outputs[pos].value = tx_out.value;
@@ -371,7 +363,7 @@ impl Batch {
       }
     }
 
-    let commit_input = if self.parent_info.is_some() { 1 } else { reveal_inputs.len() - 1 };
+    let commit_input = if self.parent_info.is_some() { 1 } else { 0 };
 
     let (_, reveal_fee) = Self::build_reveal_transaction(
       &control_block,
@@ -382,6 +374,35 @@ impl Batch {
       &reveal_script,
     );
 
+    let reveal_cardinal_satpoint = Self::find_cardinal_utxo(
+      &reveal_fee,
+      Some(cardinal_satpoint.outpoint),
+      &utxos,
+      wallet_inscriptions.clone(),
+      locked_utxos.clone(),
+      runic_utxos.clone()
+    );
+
+    if let Ok(reveal_cardinal_tx_out) = index.get_tx_out(reveal_cardinal_satpoint) {
+      reveal_tx_outs.push(reveal_cardinal_tx_out.clone());
+      reveal_inputs.push(reveal_cardinal_satpoint.outpoint);
+      reveal_outputs.push(TxOut {
+        script_pubkey: commit_tx_address.script_pubkey(),
+        value: reveal_cardinal_tx_out.value
+      });
+    }
+
+    let reveal_cardinal_output = reveal_outputs.len() - 1;
+    let reveal_cardinal_value = reveal_outputs[reveal_cardinal_output].value;
+
+    /* DEBUG */
+    reveal_outputs[reveal_cardinal_output].value = reveal_cardinal_value - reveal_fee.to_sat();
+    let out_val = reveal_outputs[reveal_cardinal_output].value;
+
+    println!("reveal_cardinal_value {reveal_cardinal_value}");
+    println!("reveal_fee {reveal_fee}");
+    println!("out_val {out_val}");
+
     let unsigned_commit_tx = TransactionBuilder::new(
       commit_satpoint,
       wallet_inscriptions,
@@ -391,7 +412,7 @@ impl Batch {
       commit_tx_address.clone(),
       change,
       self.commit_fee_rate,
-      Target::Value(reveal_fee + total_postage),
+      Target::Value(Amount::from_sat(reveal_outputs[0].value)),
     )
     .build_transaction()?;
 
@@ -579,6 +600,35 @@ impl Batch {
     (reveal_tx, fee)
   }
 
+  fn find_cardinal_utxo (
+    min_amount: &Amount,
+    used_outpoint: Option<OutPoint>,
+    utxos: &BTreeMap<OutPoint, Amount>,
+    wallet_inscriptions: BTreeMap<SatPoint, InscriptionId>,
+    locked_utxos: BTreeSet<OutPoint>,
+    runic_utxos: BTreeSet<OutPoint>,
+  ) -> SatPoint {
+    let inscribed_utxos = wallet_inscriptions
+        .keys()
+        .map(|satpoint| satpoint.outpoint)
+        .collect::<BTreeSet<OutPoint>>();
+
+    return utxos
+      .iter()
+      .find(|(outpoint, amount)| {
+        amount.to_sat() > min_amount.to_sat()
+          && !inscribed_utxos.contains(outpoint)
+          && !locked_utxos.contains(outpoint)
+          && !runic_utxos.contains(outpoint)
+          && used_outpoint != Some(**outpoint)
+      })
+      .map(|(outpoint, _amount)| SatPoint {
+        outpoint: *outpoint,
+        offset: 0,
+      })
+      .expect("wallet contains no cardinal utxos")
+  }
+
   fn calculate_fee(tx: &Transaction, utxos: &BTreeMap<OutPoint, Amount>) -> u64 {
     tx.input
       .iter()
@@ -702,10 +752,12 @@ impl Batchfile {
       )?);
 
       if let Some(satpoint) = entry.satpoint {
+        let tx_out = index.get_tx_out(satpoint)?;
+        pointer += tx_out.value;
         satpoints.push(satpoint);
+      } else {
+        pointer += postage.to_sat();
       }
-
-      pointer += postage.to_sat();
     }
 
     let destinations = match self.mode {
