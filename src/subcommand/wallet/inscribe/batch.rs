@@ -132,8 +132,10 @@ impl Batch {
       Self::backup_recovery_key(client, recovery_key_pair, chain.network())?;
     }
 
+    println!("commit tx {:?}", commit_tx);
     let commit = client.send_raw_transaction(&signed_commit_tx)?;
 
+    println!("reveal tx {:?}", reveal_tx);
     let reveal = match client.send_raw_transaction(&signed_reveal_tx) {
       Ok(txid) => txid,
       Err(err) => {
@@ -246,9 +248,15 @@ impl Batch {
       ),
     }
 
+    let mut used_outpoints =
+      self.reveal_satpoints
+          .iter()
+          .map(|satpoint| satpoint.outpoint)
+          .collect::<BTreeSet<OutPoint>>();
+
     let cardinal_satpoint = Self::find_cardinal_utxo(
       &Amount::from_sat(0),
-      None,
+      used_outpoints.clone(),
       &utxos,
       wallet_inscriptions.clone(),
       locked_utxos.clone(),
@@ -258,7 +266,7 @@ impl Batch {
     let commit_satpoint = if let Some(commit_satpoint) = self.commit_satpoint {
       commit_satpoint
     } else {
-      cardinal_satpoint
+      cardinal_satpoint.unwrap()
     };
 
     let mut reinscription = false;
@@ -374,47 +382,21 @@ impl Batch {
       &reveal_script,
     );
 
-    let reveal_cardinal_satpoint = Self::find_cardinal_utxo(
-      &reveal_fee,
-      Some(cardinal_satpoint.outpoint),
-      &utxos,
-      wallet_inscriptions.clone(),
-      locked_utxos.clone(),
-      runic_utxos.clone()
-    );
-
-    if let Ok(reveal_cardinal_tx_out) = index.get_tx_out(reveal_cardinal_satpoint) {
-      reveal_tx_outs.push(reveal_cardinal_tx_out.clone());
-      reveal_inputs.push(reveal_cardinal_satpoint.outpoint);
-      reveal_outputs.push(TxOut {
-        script_pubkey: commit_tx_address.script_pubkey(),
-        value: reveal_cardinal_tx_out.value
-      });
-    }
-
-    let reveal_cardinal_output = reveal_outputs.len() - 1;
-    let reveal_cardinal_value = reveal_outputs[reveal_cardinal_output].value;
-
-    /* DEBUG */
-    reveal_outputs[reveal_cardinal_output].value = reveal_cardinal_value - reveal_fee.to_sat();
-    let out_val = reveal_outputs[reveal_cardinal_output].value;
-
-    println!("reveal_cardinal_value {reveal_cardinal_value}");
-    println!("reveal_fee {reveal_fee}");
-    println!("out_val {out_val}");
-
     let unsigned_commit_tx = TransactionBuilder::new(
       commit_satpoint,
-      wallet_inscriptions,
+      wallet_inscriptions.clone(),
       utxos.clone(),
       locked_utxos.clone(),
-      runic_utxos,
+      runic_utxos.clone(),
       commit_tx_address.clone(),
       change,
       self.commit_fee_rate,
       Target::Value(Amount::from_sat(reveal_outputs[0].value)),
     )
     .build_transaction()?;
+
+    let rev_out_val = reveal_outputs[0].value;
+    println!("reveal out value {rev_out_val}");
 
     let (vout, _commit_output) = unsigned_commit_tx
       .output
@@ -427,6 +409,37 @@ impl Batch {
       txid: unsigned_commit_tx.txid(),
       vout: vout.try_into().unwrap(),
     };
+
+    let commit_cardinal_input = unsigned_commit_tx.input.len() - 1;
+    used_outpoints.insert(unsigned_commit_tx.input[commit_cardinal_input].previous_output);
+
+    if let Some(reveal_cardinal_satpoint) = Self::find_cardinal_utxo(
+        &reveal_fee,
+        used_outpoints.clone(),
+        &utxos,
+        wallet_inscriptions.clone(),
+        locked_utxos.clone(),
+        runic_utxos.clone()
+      ) {
+      if let Ok(reveal_cardinal_tx_out) = index.get_tx_out(reveal_cardinal_satpoint) {
+        reveal_tx_outs.push(reveal_cardinal_tx_out.clone());
+        reveal_inputs.push(reveal_cardinal_satpoint.outpoint);
+        reveal_outputs.push(TxOut {
+          script_pubkey: commit_tx_address.script_pubkey(),
+          value: reveal_cardinal_tx_out.value
+        });
+      }
+    }
+
+    let reveal_cardinal_output = reveal_outputs.len() - 1;
+    let reveal_cardinal_value = reveal_outputs[reveal_cardinal_output].value;
+    reveal_outputs[reveal_cardinal_output].value = reveal_cardinal_value - reveal_fee.to_sat();
+
+    /* DEBUG */
+    let out_val = reveal_outputs[reveal_cardinal_output].value;
+    println!("reveal_cardinal_value {reveal_cardinal_value}");
+    println!("reveal_fee {reveal_fee}");
+    println!("out_val {out_val}");
 
     let (mut reveal_tx, _fee) = Self::build_reveal_transaction(
       &control_block,
@@ -602,12 +615,12 @@ impl Batch {
 
   fn find_cardinal_utxo (
     min_amount: &Amount,
-    used_outpoint: Option<OutPoint>,
+    used_outpoints: BTreeSet<OutPoint>,
     utxos: &BTreeMap<OutPoint, Amount>,
     wallet_inscriptions: BTreeMap<SatPoint, InscriptionId>,
     locked_utxos: BTreeSet<OutPoint>,
     runic_utxos: BTreeSet<OutPoint>,
-  ) -> SatPoint {
+  ) -> Option<SatPoint> {
     let inscribed_utxos = wallet_inscriptions
         .keys()
         .map(|satpoint| satpoint.outpoint)
@@ -620,13 +633,12 @@ impl Batch {
           && !inscribed_utxos.contains(outpoint)
           && !locked_utxos.contains(outpoint)
           && !runic_utxos.contains(outpoint)
-          && used_outpoint != Some(**outpoint)
+          && !used_outpoints.contains(outpoint)
       })
       .map(|(outpoint, _amount)| SatPoint {
         outpoint: *outpoint,
         offset: 0,
       })
-      .expect("wallet contains no cardinal utxos")
   }
 
   fn calculate_fee(tx: &Transaction, utxos: &BTreeMap<OutPoint, Amount>) -> u64 {
