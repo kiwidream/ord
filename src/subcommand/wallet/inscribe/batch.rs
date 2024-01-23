@@ -299,29 +299,6 @@ impl Batch {
       ));
     }
 
-    let secp256k1 = Secp256k1::new();
-    let key_pair = UntweakedKeyPair::new(&secp256k1, &mut rand::thread_rng());
-    let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
-
-    let reveal_script = Inscription::append_batch_reveal_script(
-      &self.inscriptions,
-      ScriptBuf::builder()
-        .push_slice(public_key.serialize())
-        .push_opcode(opcodes::all::OP_CHECKSIG),
-    );
-
-    let taproot_spend_info = TaprootBuilder::new()
-      .add_leaf(0, reveal_script.clone())
-      .expect("adding leaf should work")
-      .finalize(&secp256k1, public_key)
-      .expect("finalizing taproot builder should work");
-
-    let control_block = taproot_spend_info
-      .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
-      .expect("should compute control block");
-
-    let commit_tx_address = Address::p2tr_tweaked(taproot_spend_info.output_key(), chain.network());
-
     let total_postage = match self.mode {
       Mode::SameSat => self.postage,
       Mode::SharedOutput | Mode::SeparateOutputs => {
@@ -373,6 +350,29 @@ impl Batch {
 
     let commit_input = if self.parent_info.is_some() { 1 } else { 0 };
 
+    let mut pointer: u64 = 0;
+    let mut inscriptions = Vec::new();
+    for (pos, _inscription) in self.inscriptions.iter().enumerate() {
+      let mut inscription_mod = self.inscriptions[pos].clone();
+      inscription_mod.pointer = Some(Inscription::pointer_value(pointer));
+      inscriptions.push(inscription_mod);
+
+      if pos == commit_input {
+        pointer += TARGET_POSTAGE.to_sat();
+      } else {
+        pointer += reveal_tx_outs[pos].value;
+      }
+    }
+
+    let Ok((
+      key_pair,
+      control_block,
+      taproot_spend_info,
+      reveal_script
+    )) = self.build_reveal_script(inscriptions) else { bail!("Failed to build reveal script") };
+
+    let commit_tx_address = Address::p2tr_tweaked(taproot_spend_info.output_key(), chain.network());
+
     let (_, reveal_fee) = Self::build_reveal_transaction(
       &control_block,
       self.reveal_fee_rate,
@@ -391,14 +391,11 @@ impl Batch {
       commit_tx_address.clone(),
       change,
       self.commit_fee_rate,
-      Target::Value(Amount::from_sat(reveal_outputs[0].value)),
+      Target::ExactPostage(TARGET_POSTAGE),
     )
     .build_transaction()?;
 
-    let rev_out_val = reveal_outputs[0].value;
-    println!("reveal out value {rev_out_val}");
-
-    let (vout, _commit_output) = unsigned_commit_tx
+    let (vout, commit_output) = unsigned_commit_tx
       .output
       .iter()
       .enumerate()
@@ -411,16 +408,19 @@ impl Batch {
     };
 
     let commit_cardinal_input = unsigned_commit_tx.input.len() - 1;
-    used_outpoints.insert(unsigned_commit_tx.input[commit_cardinal_input].previous_output);
+    let commit_cardinal_outpoint = unsigned_commit_tx.input[commit_cardinal_input].previous_output;
+    println!("commit_cardinal_outpoint {commit_cardinal_outpoint}");
+    used_outpoints.insert(commit_cardinal_outpoint);
 
     if let Some(reveal_cardinal_satpoint) = Self::find_cardinal_utxo(
         &reveal_fee,
-        used_outpoints.clone(),
+        used_outpoints,
         &utxos,
         wallet_inscriptions.clone(),
         locked_utxos.clone(),
         runic_utxos.clone()
       ) {
+        println!("reveal_cardinal_satpoint {reveal_cardinal_satpoint}");
       if let Ok(reveal_cardinal_tx_out) = index.get_tx_out(reveal_cardinal_satpoint) {
         reveal_tx_outs.push(reveal_cardinal_tx_out.clone());
         reveal_inputs.push(reveal_cardinal_satpoint.outpoint);
@@ -433,7 +433,9 @@ impl Batch {
 
     let reveal_cardinal_output = reveal_outputs.len() - 1;
     let reveal_cardinal_value = reveal_outputs[reveal_cardinal_output].value;
+
     reveal_outputs[reveal_cardinal_output].value = reveal_cardinal_value - reveal_fee.to_sat();
+    reveal_outputs[commit_input].value = commit_output.value;
 
     /* DEBUG */
     let out_val = reveal_outputs[reveal_cardinal_output].value;
@@ -484,6 +486,8 @@ impl Batch {
       )
       .expect("signature hash should compute");
 
+    let secp256k1 = Secp256k1::new();
+
     let sig = secp256k1.sign_schnorr(
       &secp256k1::Message::from_slice(sighash.as_ref())
         .expect("should be cryptographically secure hash"),
@@ -506,8 +510,8 @@ impl Batch {
     witness.push(&control_block.serialize());
 
     let recovery_key_pair = key_pair.tap_tweak(&secp256k1, taproot_spend_info.merkle_root());
-
     let (x_only_pub_key, _parity) = recovery_key_pair.to_inner().x_only_public_key();
+
     assert_eq!(
       Address::p2tr_tweaked(
         TweakedPublicKey::dangerous_assume_tweaked(x_only_pub_key),
@@ -564,6 +568,34 @@ impl Batch {
     }
 
     Ok(())
+  }
+
+  fn build_reveal_script(
+    &self,
+    inscriptions: Vec<Inscription>
+  ) -> Result<(UntweakedKeyPair, ControlBlock, TaprootSpendInfo, ScriptBuf)> {
+    let secp256k1 = Secp256k1::new();
+    let key_pair = UntweakedKeyPair::new(&secp256k1, &mut rand::thread_rng());
+    let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
+
+    let reveal_script = Inscription::append_batch_reveal_script(
+      &inscriptions,
+      ScriptBuf::builder()
+        .push_slice(public_key.serialize())
+        .push_opcode(opcodes::all::OP_CHECKSIG),
+    );
+
+    let taproot_spend_info = TaprootBuilder::new()
+      .add_leaf(0, reveal_script.clone())
+      .expect("adding leaf should work")
+      .finalize(&secp256k1, public_key)
+      .expect("finalizing taproot builder should work");
+
+    let control_block = taproot_spend_info
+      .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
+      .expect("should compute control block");
+
+    Ok((key_pair, control_block, taproot_spend_info, reveal_script))
   }
 
   fn build_reveal_transaction(
@@ -625,6 +657,8 @@ impl Batch {
         .keys()
         .map(|satpoint| satpoint.outpoint)
         .collect::<BTreeSet<OutPoint>>();
+
+    println!("used_outpoints {:?}", used_outpoints);
 
     return utxos
       .iter()

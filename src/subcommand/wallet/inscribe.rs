@@ -10,7 +10,7 @@ use {
     secp256k1::{self, constants::SCHNORR_SIGNATURE_SIZE, rand, Secp256k1, XOnlyPublicKey},
     sighash::{Prevouts, SighashCache, TapSighashType},
     taproot::Signature,
-    taproot::{ControlBlock, LeafVersion, TapLeafHash, TaprootBuilder},
+    taproot::{ControlBlock, LeafVersion, TapLeafHash, TaprootBuilder, TaprootSpendInfo},
   },
   bitcoincore_rpc::bitcoincore_rpc_json::{ImportDescriptors, SignRawTransactionInput, Timestamp},
   bitcoincore_rpc::Client,
