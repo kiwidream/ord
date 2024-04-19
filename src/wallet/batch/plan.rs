@@ -157,11 +157,14 @@ impl Plan {
         .bitcoin_client()
         .send_raw_transaction(&signed_reveal_tx)
       {
-        Ok(txid) => txid,
+        Ok(txid) => {
+          println!("Transaction ID: {}. Hex {:?}", txid, signed_reveal_tx); // Print the transaction ID
+          txid
+        },
         Err(err) => {
           return Err(anyhow!(
-        "Failed to send reveal transaction: {err}\nCommit tx {commit_txid} will be recovered once mined"
-      ))
+            "Failed to send reveal transaction: {err}\nCommit tx {commit_txid} will be recovered once mined. Hex: {:?}", signed_reveal_tx
+          ))
         }
       };
 
@@ -726,7 +729,7 @@ impl Plan {
         })
         .collect(),
       output,
-      lock_time: LockTime::ZERO,
+      lock_time: LockTime::from_height(840000).expect("valid height"),
       version: 2,
     };
 
